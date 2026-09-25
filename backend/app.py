@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -42,6 +43,15 @@ class BatchIn(BaseModel):
     steps: list[StepIn]
 
 
+class TargetIn(BaseModel):
+    herb: str = Field(min_length=1, max_length=80)
+    target_minutes: int = Field(ge=0, le=1440)
+
+
+class SoakStartIn(BaseModel):
+    herb: str = Field(min_length=1, max_length=80)
+
+
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
     if credentials is None:
         raise HTTPException(status_code=401, detail="未登录")
@@ -75,6 +85,24 @@ def startup():
                 reason text NOT NULL,
                 created_by text NOT NULL,
                 created_at timestamptz NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS soak_targets (
+                herb text PRIMARY KEY,
+                target_minutes integer NOT NULL,
+                updated_by text NOT NULL,
+                updated_at timestamptz NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS soaks (
+                id serial PRIMARY KEY,
+                herb text NOT NULL,
+                target_minutes integer NOT NULL,
+                started_at timestamptz NOT NULL,
+                started_by text NOT NULL,
+                used_at timestamptz
             )"""
         )
         count = conn.execute("SELECT COUNT(*) AS n FROM batches").fetchone()["n"]
@@ -116,16 +144,101 @@ def list_batches(_user: dict = Depends(current_user)):
     return rows
 
 
+def soak_status(row: dict, now: datetime) -> dict:
+    elapsed_seconds = max(0.0, (now - row["started_at"]).total_seconds())
+    remaining = math.ceil((row["target_minutes"] * 60 - elapsed_seconds) / 60)
+    remaining = max(0, remaining)
+    return {
+        **row,
+        "elapsed_minutes": int(elapsed_seconds // 60),
+        "remaining_minutes": remaining,
+        "ready": remaining == 0,
+    }
+
+
+def active_soak(conn, herb: str) -> dict | None:
+    return conn.execute(
+        "SELECT id, herb, target_minutes, started_at, started_by FROM soaks WHERE herb = %s AND used_at IS NULL ORDER BY id DESC LIMIT 1",
+        (herb,),
+    ).fetchone()
+
+
+@app.get("/api/soaks")
+def list_soaks(_user: dict = Depends(current_user)):
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        targets = conn.execute(
+            "SELECT herb, target_minutes, updated_by, updated_at FROM soak_targets ORDER BY herb"
+        ).fetchall()
+        rows = conn.execute(
+            "SELECT id, herb, target_minutes, started_at, started_by FROM soaks WHERE used_at IS NULL ORDER BY id DESC"
+        ).fetchall()
+    return {
+        "server_now": now,
+        "targets": targets,
+        "active": [soak_status(r, now) for r in rows],
+    }
+
+
+@app.put("/api/soaks/targets")
+def set_soak_target(body: TargetIn, user: dict = Depends(require_writer)):
+    herb = body.herb.strip()
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO soak_targets (herb, target_minutes, updated_by, updated_at)
+               VALUES (%s, %s, %s, %s)
+               ON CONFLICT (herb) DO UPDATE SET
+                   target_minutes = EXCLUDED.target_minutes,
+                   updated_by = EXCLUDED.updated_by,
+                   updated_at = EXCLUDED.updated_at""",
+            (herb, body.target_minutes, user["username"], datetime.now(timezone.utc)),
+        )
+        conn.commit()
+    return {"herb": herb, "target_minutes": body.target_minutes}
+
+
+@app.post("/api/soaks/start", status_code=201)
+def start_soak(body: SoakStartIn, user: dict = Depends(require_writer)):
+    herb = body.herb.strip()
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        target = conn.execute("SELECT target_minutes FROM soak_targets WHERE herb = %s", (herb,)).fetchone()
+        if target is None:
+            raise HTTPException(status_code=409, detail="请先在浸泡台为该味设置浸泡目标分钟")
+        if active_soak(conn, herb) is not None:
+            raise HTTPException(status_code=409, detail="该味已有进行中的浸泡")
+        row = conn.execute(
+            """INSERT INTO soaks (herb, target_minutes, started_at, started_by)
+               VALUES (%s, %s, %s, %s)
+               RETURNING id, herb, target_minutes, started_at, started_by""",
+            (herb, target["target_minutes"], now, user["username"]),
+        ).fetchone()
+        conn.commit()
+    return soak_status(row, now)
+
+
 @app.post("/api/batches", status_code=201)
 def create_batch(body: BatchIn, user: dict = Depends(require_writer)):
     doc = {"steps": [s.model_dump() for s in body.steps]}
-    verdict, reason = judge(doc)
+    herb = body.herb.strip()
+    now = datetime.now(timezone.utc)
+    soak = None
     with connect() as conn:
+        if any(s.name == "清炒" for s in body.steps):
+            soak = active_soak(conn, herb)
+            if soak is None:
+                raise HTTPException(status_code=409, detail="该味尚未登记浸泡，请先在浸泡台开始浸泡")
+            remaining = math.ceil((soak["target_minutes"] * 60 - (now - soak["started_at"]).total_seconds()) / 60)
+            if remaining > 0:
+                raise HTTPException(status_code=409, detail=f"浸泡未满，还差 {remaining} 分钟")
+        verdict, reason = judge(doc)
         row = conn.execute(
             """INSERT INTO batches (herb, doc, verdict, reason, created_by, created_at)
                VALUES (%s, %s::jsonb, %s, %s, %s, %s)
                RETURNING id, herb, doc, verdict, reason, created_by""",
-            (body.herb.strip(), json.dumps(doc, ensure_ascii=False), verdict, reason, user["username"], datetime.now(timezone.utc)),
+            (herb, json.dumps(doc, ensure_ascii=False), verdict, reason, user["username"], now),
         ).fetchone()
+        if soak is not None:
+            conn.execute("UPDATE soaks SET used_at = %s WHERE id = %s", (now, soak["id"]))
         conn.commit()
     return row
